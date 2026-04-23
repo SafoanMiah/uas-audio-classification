@@ -1,4 +1,5 @@
-"""Three architectures: SVM baseline, 5-block CNN, PANNs CNN10."""
+import urllib.request
+from pathlib import Path
 
 import torch
 import torch.nn as nn
@@ -11,14 +12,14 @@ from sklearn.calibration import CalibratedClassifierCV
 import config as cfg
 
 
-# SVM baseline on hand-engineered features (wrapped so it gives probabilities)
 def build_svm():
-    base = LinearSVC(C=cfg.SVM_C, class_weight=cfg.SVM_CLASS_WEIGHT, max_iter=5000)
-    clf = CalibratedClassifierCV(base, cv=3)  # for predict_proba
+    base = LinearSVC(C=cfg.SVM_C, class_weight="balanced", max_iter=5000)
+    clf = CalibratedClassifierCV(base, cv=3)  # needed for predict_proba
     return Pipeline([("scaler", StandardScaler()), ("svm", clf)])
 
 
-# 5-block CNN trained from scratch on log-mel spectrograms
+# 5-block CNN trained from scratch on log-mel spectrograms.
+# Dropout is applied only after the FC layer, not per-block, to avoid
 class SimpleCNN(nn.Module):
     def __init__(self, n_classes=cfg.NUM_CLASSES):
         super(SimpleCNN, self).__init__()
@@ -26,13 +27,10 @@ class SimpleCNN(nn.Module):
         in_ch = 1
         blocks = []
         for out_ch in cfg.CNN_CHANNELS:
-            blocks.append(
-                nn.Conv2d(in_ch, out_ch, kernel_size=cfg.CNN_KERNEL_SIZE, padding=1)
-            )
+            blocks.append(nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1))
             blocks.append(nn.BatchNorm2d(out_ch))
             blocks.append(nn.ReLU())
-            blocks.append(nn.MaxPool2d(cfg.CNN_POOL_SIZE))
-            blocks.append(nn.Dropout2d(cfg.CNN_DROPOUT))
+            blocks.append(nn.MaxPool2d(2))
             in_ch = out_ch
         self.features = nn.Sequential(*blocks)
 
@@ -49,7 +47,8 @@ class SimpleCNN(nn.Module):
         return self.fc2(x)
 
 
-# PANNs CNN10 backbone (mirrors Kong et al. 2020)
+# PANNs CNN10 (Kong et al. 2020). Block names match the pretrained
+# checkpoint so state_dict loading works.
 class ConvBlock(nn.Module):
     def __init__(self, in_ch, out_ch):
         super(ConvBlock, self).__init__()
@@ -94,7 +93,15 @@ class PANNCnn10(nn.Module):
         return [self.conv_block1, self.conv_block2, self.conv_block3, self.conv_block4]
 
 
-# Load PANNs weights and swap the classifier head
+def download_pann_checkpoint(dest_path):
+    dest_path = Path(dest_path)
+    dest_path.parent.mkdir(parents=True, exist_ok=True)
+    if not dest_path.exists():
+        print(f"Downloading PANN CNN10 to {dest_path}")
+        urllib.request.urlretrieve(cfg.PANN_CKPT_URL, dest_path)
+    return dest_path
+
+
 def load_pann_cnn10(checkpoint_path, n_classes=cfg.NUM_CLASSES):
     model = PANNCnn10(n_classes=n_classes)
 
@@ -116,43 +123,27 @@ def load_pann_cnn10(checkpoint_path, n_classes=cfg.NUM_CLASSES):
     return model
 
 
-def download_pann_checkpoint(dest_path):
-    import urllib.request
-    from pathlib import Path
-
-    dest_path = Path(dest_path)
-    dest_path.parent.mkdir(parents=True, exist_ok=True)
-    if not dest_path.exists():
-        print(f"Downloading PANN CNN10 to {dest_path}")
-        urllib.request.urlretrieve(cfg.PANN_CKPT_URL, dest_path)
-    return dest_path
-
-
 # Progressive unfreezing: 0 = head only, 1 = + last block, 2 = + last two blocks
 def set_unfreeze_stage(model, n_blocks_unfrozen):
-    blocks = model.blocks()
-    # Freeze everything first
     for p in model.parameters():
         p.requires_grad = False
-    # Unfreeze the head
     for p in model.fc1.parameters():
         p.requires_grad = True
     for p in model.fc_out.parameters():
         p.requires_grad = True
-    # Unfreeze the last N conv blocks
-    for block in blocks[-n_blocks_unfrozen:] if n_blocks_unfrozen > 0 else []:
-        for p in block.parameters():
-            p.requires_grad = True
+    if n_blocks_unfrozen > 0:
+        for block in model.blocks()[-n_blocks_unfrozen:]:
+            for p in block.parameters():
+                p.requires_grad = True
 
 
-# Split params into two groups so we can use differential learning rates
+# Differential learning rates for head vs backbone
 def param_groups(model, lr_head, lr_backbone):
     head_params, backbone_params = [], []
-    head_names = ("fc1", "fc_out")
     for name, p in model.named_parameters():
         if not p.requires_grad:
             continue
-        if any(name.startswith(h) for h in head_names):
+        if name.startswith(("fc1", "fc_out")):
             head_params.append(p)
         else:
             backbone_params.append(p)
@@ -167,5 +158,3 @@ def count_params(model):
     total = sum(p.numel() for p in model.parameters())
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     return total, trainable
-
-
