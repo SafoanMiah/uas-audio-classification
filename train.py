@@ -14,6 +14,16 @@ import data
 import models
 
 
+def compute_class_weights(manifest, device):
+    counts = manifest["label"].value_counts().to_dict()
+    weights = torch.tensor(
+        [1.0 / counts.get(c, 1) for c in cfg.CLASSES],
+        dtype=torch.float32,
+    )
+    weights = weights / weights.sum() * cfg.NUM_CLASSES
+    return weights.to(device)
+
+
 # One training pass. Returns (loss, accuracy).
 def train_epoch(model, train_loader, criterion, optimizer, device):
     model.train()
@@ -23,10 +33,20 @@ def train_epoch(model, train_loader, criterion, optimizer, device):
 
     for inputs, labels in tqdm(train_loader, desc="Training", leave=False):
         inputs, labels = inputs.to(device), labels.to(device)
-
         optimizer.zero_grad()
-        outputs = model(inputs)
-        loss = criterion(outputs, labels)
+
+        if cfg.USE_MIXUP:
+            labels_oh = F.one_hot(labels, cfg.NUM_CLASSES).float()
+            inputs_m, labels_m = data.mixup_batch(inputs, labels_oh)
+            outputs = model(inputs_m)
+            log_probs = F.log_softmax(outputs, dim=1)
+            if criterion.weight is not None:
+                log_probs = log_probs * criterion.weight
+            loss = -(labels_m * log_probs).sum(dim=1).mean()
+        else:
+            outputs = model(inputs)
+            loss = criterion(outputs, labels)
+
         loss.backward()
         optimizer.step()
 
@@ -39,7 +59,6 @@ def train_epoch(model, train_loader, criterion, optimizer, device):
 
 
 # One evaluation pass. Returns loss, accuracy, preds, probs, labels.
-# We keep probs for AUC-ROC and bootstrap CIs later.
 def evaluate(model, loader, criterion, device):
     model.eval()
     running_loss = 0.0
@@ -87,7 +106,7 @@ def compute_metrics(labels, preds, probs):
 
 
 # Drive the epoch loop with early stopping on validation macro-F1.
-# This wraps the notebook-level pattern so we can call it per PANN stage.
+#
 def train_model(
     model,
     train_loader,
@@ -97,8 +116,9 @@ def train_model(
     num_epochs,
     patience,
     ckpt_path=None,
+    class_weights=None,
 ):
-    criterion = nn.CrossEntropyLoss()
+    criterion = nn.CrossEntropyLoss(weight=class_weights)
 
     best_f1 = -1
     best_state = None
@@ -154,13 +174,13 @@ def train_model(
 
 
 # Three-stage PANN fine-tuning
-def train_pann_progressive(model, train_loader, val_loader, device, save_ckpts=True):
+def train_pann_progressive(
+    model, train_loader, val_loader, device, save_ckpts=True, class_weights=None
+):
     all_history = {}
 
     for stage_name, epochs, lr_head, lr_bb, n_unfrozen in cfg.PANN_STAGES:
-        print("\n" + "=" * 40)
         print(f"PANN {stage_name}")
-        print("=" * 40)
 
         models.set_unfreeze_stage(model, n_unfrozen)
         total, trainable = models.count_params(model)
@@ -179,6 +199,7 @@ def train_pann_progressive(model, train_loader, val_loader, device, save_ckpts=T
             num_epochs=epochs,
             patience=cfg.PANN_EARLY_STOPPING_PATIENCE,
             ckpt_path=ckpt,
+            class_weights=class_weights,
         )
         all_history[stage_name] = hist
 
@@ -236,6 +257,23 @@ def full_evaluate(model, loader, device):
     }
 
 
+def extract_svm_dataset(manifest):
+    X, y = [], []
+    for _, row in manifest.iterrows():
+        wav = data.load_audio(row["path"])
+        for seg in data.segment_audio(wav):
+            X.append(data.extract_svm_features(seg))
+            y.append(cfg.CLASS_TO_IDX[row["label"]])
+    return np.array(X), np.array(y)
+
+
+def train_svm(train_manifest):
+    X, y = extract_svm_dataset(train_manifest)
+    pipeline = models.build_svm()
+    pipeline.fit(X, y)
+    return pipeline
+
+
 # SVM evaluation (sklearn interface)
 def evaluate_svm(pipeline, X_test, y_test):
     preds = pipeline.predict(X_test)
@@ -263,24 +301,46 @@ def cross_source_eval(model, holdout_manifest, device, is_torch=True, batch_size
         return full_evaluate(model, loader, device)
 
     # SVM path
-    X, y = [], []
-    for _, row in holdout_manifest.iterrows():
-        wav = data.load_audio(row["path"])
-        for seg in data.segment_audio(wav):
-            X.append(data.extract_svm_features(seg))
-            y.append(cfg.CLASS_TO_IDX[row["label"]])
-    return evaluate_svm(model, np.array(X), np.array(y))
+    X, y = extract_svm_dataset(holdout_manifest)
+    return evaluate_svm(model, X, y)
 
 
 # SNR degradation sweep
-def snr_degradation_curve(model, test_manifest, noise_manifest, device, batch_size=32):
+def snr_degradation_curve(
+    model,
+    test_manifest,
+    noise_manifest,
+    device,
+    is_torch=True,
+    batch_size=32,
+    classes=("drone", "helicopter"),
+):
+    """SNR sweep. Background class is excluded because it is already
+    environmental audio — adding noise to it has no SNR interpretation."""
+    test_manifest = test_manifest[test_manifest["label"].isin(classes)]
     results = []
+
     for snr in cfg.SNR_LEVELS_DB:
-        ds = data.AudioDataset(
-            test_manifest, augment=False, snr_db=snr, noise_manifest=noise_manifest
-        )
-        loader = data.make_loader(ds, batch_size=batch_size, shuffle=False)
-        out = full_evaluate(model, loader, device)
+        if is_torch:
+            ds = data.AudioDataset(
+                test_manifest, augment=False, snr_db=snr, noise_manifest=noise_manifest
+            )
+            loader = data.make_loader(ds, batch_size=batch_size, shuffle=False)
+            out = full_evaluate(model, loader, device)
+        else:
+            X, y = [], []
+            for _, row in test_manifest.iterrows():
+                wav = data.load_audio(row["path"])
+                for seg in data.segment_audio(wav):
+                    if snr != "clean":
+                        noise = data.load_audio(
+                            np.random.choice(noise_manifest["path"].values)
+                        )
+                        seg = data.mix_at_snr(seg, noise, snr)
+                    X.append(data.extract_svm_features(seg))
+                    y.append(cfg.CLASS_TO_IDX[row["label"]])
+            out = evaluate_svm(model, np.array(X), np.array(y))
+
         results.append(
             {
                 "snr_db": snr,
@@ -293,45 +353,7 @@ def snr_degradation_curve(model, test_manifest, noise_manifest, device, batch_si
             f"SNR {snr}: macro_f1 = {out['macro_f1']:.4f} "
             f"[{out['f1_ci'][1]:.4f}, {out['f1_ci'][2]:.4f}]"
         )
+
     return pd.DataFrame(results)
 
 
-# Test
-if __name__ == "__main__":
-    from torch.utils.data import TensorDataset, DataLoader
-
-    print("TRAIN PIPELINE SMOKE TEST")
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
-
-    # Fake spectrograms: 40 train + 16 val, 3 classes
-    X_train = torch.randn(40, 1, cfg.N_MELS, 200)
-    y_train = torch.randint(0, cfg.NUM_CLASSES, (40,))
-    X_val = torch.randn(16, 1, cfg.N_MELS, 200)
-    y_val = torch.randint(0, cfg.NUM_CLASSES, (16,))
-
-    train_loader = DataLoader(
-        TensorDataset(X_train, y_train), batch_size=8, shuffle=True
-    )
-    val_loader = DataLoader(TensorDataset(X_val, y_val), batch_size=8)
-
-    model = models.SimpleCNN().to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
-
-    model, history = train_model(
-        model,
-        train_loader,
-        val_loader,
-        optimizer,
-        device,
-        num_epochs=2,
-        patience=5,
-    )
-
-    print("\nRunning full evaluation...")
-    out = full_evaluate(model, val_loader, device)
-    print(f"macro_f1 = {out['macro_f1']:.4f}")
-    print(f"f1 CI = [{out['f1_ci'][1]:.4f}, {out['f1_ci'][2]:.4f}]")
-    print(f"auc_per_class = {out['auc_per_class']}")
-    print(f"confusion_matrix:\n{out['confusion_matrix']}")

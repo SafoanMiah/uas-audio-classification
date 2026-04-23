@@ -10,8 +10,10 @@ from pathlib import Path
 DRIVE_ROOT = Path(__file__).resolve().parent
 DATA_ROOT = DRIVE_ROOT / "data"
 TRAIN_ROOT = DRIVE_ROOT / "train"
-CKPT_ROOT = DRIVE_ROOT / "checkpoints"
 MODEL_ROOT = DRIVE_ROOT / "models"
+CACHE_ROOT = DRIVE_ROOT / "cache"  # precomputed log-mels
+CKPT_ROOT = DRIVE_ROOT / "checkpoints"  # model weights
+MANIFEST_ROOT = DRIVE_ROOT / "manifests"  # split csvs
 
 # Public dataset sources
 DATASETS = {
@@ -121,11 +123,3 @@ def ensure_dirs():
         p.mkdir(parents=True, exist_ok=True)
 
 
-if __name__ == "__main__":
-    print("Drone detection config")
-    print(f"Classes: {CLASSES}")
-    print(f"Sample rate: {SAMPLE_RATE} Hz")
-    print(f"Window: {WINDOW_SECONDS}s, hop {HOP_SECONDS}s")
-    print(f"Mel bands: {N_MELS}")
-    print(f"PANN stages: {[s[0] for s in PANN_STAGES]}")
-    print(f"SNR sweep: {SNR_LEVELS_DB}")

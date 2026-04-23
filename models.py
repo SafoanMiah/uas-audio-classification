@@ -67,20 +67,20 @@ class ConvBlock(nn.Module):
 class PANNCnn10(nn.Module):
     def __init__(self, n_classes=cfg.NUM_CLASSES):
         super(PANNCnn10, self).__init__()
-        self.block1 = ConvBlock(1, 64)
-        self.block2 = ConvBlock(64, 128)
-        self.block3 = ConvBlock(128, 256)
-        self.block4 = ConvBlock(256, 512)
+        self.conv_block1 = ConvBlock(1, 64)
+        self.conv_block2 = ConvBlock(64, 128)
+        self.conv_block3 = ConvBlock(128, 256)
+        self.conv_block4 = ConvBlock(256, 512)
 
         self.fc1 = nn.Linear(512, cfg.PANN_EMBEDDING_DIM)
         self.dropout = nn.Dropout(cfg.PANN_DROPOUT)
         self.fc_out = nn.Linear(cfg.PANN_EMBEDDING_DIM, n_classes)
 
     def forward(self, x):
-        x = self.block1(x)
-        x = self.block2(x)
-        x = self.block3(x)
-        x = self.block4(x)
+        x = self.conv_block1(x)
+        x = self.conv_block2(x)
+        x = self.conv_block3(x)
+        x = self.conv_block4(x)
 
         # Global pool: mean over time, max over mel
         x = torch.mean(x, dim=3)
@@ -91,7 +91,7 @@ class PANNCnn10(nn.Module):
         return self.fc_out(x)
 
     def blocks(self):
-        return [self.block1, self.block2, self.block3, self.block4]
+        return [self.conv_block1, self.conv_block2, self.conv_block3, self.conv_block4]
 
 
 # Load PANNs weights and swap the classifier head
@@ -110,8 +110,22 @@ def load_pann_cnn10(checkpoint_path, n_classes=cfg.NUM_CLASSES):
             own[k] = v
             loaded += 1
     model.load_state_dict(own)
+    if loaded == 0:
+        raise RuntimeError(f"No pretrained weights loaded from {checkpoint_path}.")
     print(f"Loaded {loaded} pretrained tensors from {checkpoint_path}")
     return model
+
+
+def download_pann_checkpoint(dest_path):
+    import urllib.request
+    from pathlib import Path
+
+    dest_path = Path(dest_path)
+    dest_path.parent.mkdir(parents=True, exist_ok=True)
+    if not dest_path.exists():
+        print(f"Downloading PANN CNN10 to {dest_path}")
+        urllib.request.urlretrieve(cfg.PANN_CKPT_URL, dest_path)
+    return dest_path
 
 
 # Progressive unfreezing: 0 = head only, 1 = + last block, 2 = + last two blocks
@@ -155,27 +169,3 @@ def count_params(model):
     return total, trainable
 
 
-# Test
-if __name__ == "__main__":
-    print("MODEL SMOKE TEST")
-
-    dummy = torch.randn(2, 1, cfg.N_MELS, 200)  # batch of 2 spectrograms
-
-    cnn = SimpleCNN()
-    out = cnn(dummy)
-    print(f"\nSimpleCNN output: {out.shape}")
-    print(f"SimpleCNN params: {count_params(cnn)}")
-
-    pann = PANNCnn10()
-    out = pann(dummy)
-    print(f"\nPANNCnn10 output: {out.shape}")
-    print(f"PANNCnn10 params (all trainable): {count_params(pann)}")
-
-    # Test progressive unfreezing
-    for stage_name, _, _, _, n_unfrozen in cfg.PANN_STAGES:
-        set_unfreeze_stage(pann, n_unfrozen)
-        total, trainable = count_params(pann)
-        print(f"  {stage_name}: {trainable:,} / {total:,} trainable")
-
-    svm = build_svm()
-    print(f"\nSVM pipeline: {svm.named_steps}")

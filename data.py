@@ -17,7 +17,7 @@ np.random.seed(cfg.SEED)
 random.seed(cfg.SEED)
 
 
-# Svanstrom: one folder, 90 files, label is the filename prefix
+# Svanstrom
 def build_svanstrom_manifest():
     audio_dir = cfg.DATA_ROOT / "svanstrom" / "audio"
     rows = []
@@ -37,7 +37,7 @@ def build_svanstrom_manifest():
     return pd.DataFrame(rows)
 
 
-# Al-Emadi (held out for cross-source evaluation)
+# Al-Emadi
 def build_al_emadi_manifest():
     base = cfg.DATA_ROOT / "al_emadi" / "Binary_Drone_Audio"
     rows = []
@@ -199,24 +199,36 @@ class AudioDataset(Dataset):
             noise_manifest["path"].tolist() if noise_manifest is not None else None
         )
 
-        # Pre-load and segment every file once
-        self.segments = []
+        # For SNR runs we keep raw audio (noise is added per sample).
+        # Or we precompute log-mels once so epochs don't redo the STFT.
+        self.labels = []
+        self.audios = []  # populated only when snr_db is set
+        self.specs = []  # populated only when snr_db is None
+
         for _, row in manifest.iterrows():
             y = load_audio(row["path"])
             for seg in segment_audio(y):
-                self.segments.append((cfg.CLASS_TO_IDX[row["label"]], seg))
+                self.labels.append(cfg.CLASS_TO_IDX[row["label"]])
+                if snr_db is not None:
+                    self.audios.append(seg)
+                else:
+                    self.specs.append(log_mel_spectrogram(seg))
 
     def __len__(self):
-        return len(self.segments)
+        return len(self.labels)
 
     def __getitem__(self, idx):
-        label, y = self.segments[idx]
+        label = self.labels[idx]
 
-        if self.snr_db is not None and self.snr_db != "clean":
-            noise = load_audio(random.choice(self.noise_paths))
-            y = mix_at_snr(y, noise, self.snr_db)
+        if self.snr_db is not None:
+            y = self.audios[idx]
+            if self.snr_db != "clean":
+                noise = load_audio(random.choice(self.noise_paths))
+                y = mix_at_snr(y, noise, self.snr_db)
+            spec = log_mel_spectrogram(y)
+        else:
+            spec = self.specs[idx]
 
-        spec = log_mel_spectrogram(y)
         if self.augment and cfg.USE_SPECAUGMENT:
             spec = spec_augment(spec)
 
@@ -233,25 +245,3 @@ def make_loader(dataset, batch_size, shuffle):
     )
 
 
-# Smoke test
-if __name__ == "__main__":
-    cfg.ensure_dirs()
-
-    print("DATA PIPELINE SMOKE TEST")
-
-    df = build_svanstrom_manifest()
-    print(f"\nSvanstrom files: {len(df)}")
-    print(df["label"].value_counts())
-
-    df_split = recording_level_split(df)
-    print("\nSplit counts:")
-    print(df_split.groupby(["split", "label"]).size())
-
-    y = load_audio(df["path"].iloc[0])
-    segs = segment_audio(y)
-    spec = log_mel_spectrogram(segs[0])
-    feats = extract_svm_features(segs[0])
-
-    print(f"\nFirst file: {len(y)} samples -> {len(segs)} segments")
-    print(f"Spectrogram shape: {spec.shape}")
-    print(f"SVM feature vector: {feats.shape}")
